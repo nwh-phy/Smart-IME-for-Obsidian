@@ -1,0 +1,10 @@
+{
+	"id": "smart-ime-obsidian",
+	"name": "Smart IME",
+	"version": "1.0.0",
+	"minAppVersion": "0.15.0",
+	"description": "Automatically switch between Chinese and English IME based on context",
+	"author": "Your Name",
+	"authorUrl": "",
+    "isDesktopOnly": true
+}

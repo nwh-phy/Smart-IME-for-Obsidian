@@ -1,0 +1,87 @@
+Smart IME for Obsidian - 安装说明
+=====================================
+
+所有命令行操作已完成！现在只需要简单的鼠标操作：
+
+步骤 1：下载 im-select.exe
+--------------------------
+1. 打开浏览器访问：https://github.com/daipeihust/im-select/raw/master/win/out/x64/im-select.exe
+2. 文件会自动下载到你的"下载"文件夹
+
+步骤 2：安装插件到 Obsidian
+---------------------------
+1. 打开你的 Obsidian vault 文件夹（在 Obsidian 中：设置 → 关于 → 显示调试信息 → 点击 vault 路径）
+2. 进入 .obsidian 文件夹（如果看不到，需要在文件管理器中显示隐藏文件）
+3. 进入 plugins 文件夹（没有就新建一个）
+4. 新建文件夹 smart-ime
+5. 将以下文件复制到 smart-ime 文件夹：
+   - C:\Users\HP\Desktop\vibecoding\smart-ime-for-ob\main.js
+   - C:\Users\HP\Desktop\vibecoding\smart-ime-for-ob\manifest.json
+   - 你下载的 im-select.exe
+
+（macOS）
+-------
+1. 使用 Homebrew 安装依赖：
+   brew install im-select
+2. 插件会自动在以下位置查找 im-select：
+   - /opt/homebrew/bin/im-select（Apple Silicon）
+   - /usr/local/bin/im-select（Intel）
+   - .obsidian/plugins/smart-ime/im-select（若你手动放入插件目录）
+   - 系统 PATH 中的 im-select
+3. 如需获取输入法 ID，在终端执行：
+   im-select
+   记录当前英文/中文输入法的标识（例如 `com.apple.keylayout.ABC` / 第三方拼音的 bundle id）。
+
+步骤 3：启用插件
+----------------
+1. 打开 Obsidian
+2. 设置 → 第三方插件 → 关闭"安全模式"
+3. 在"已安装插件"中找到 "Smart IME"，点击启用
+
+步骤 4：配置输入法（重要！）
+----------------------------
+1. 按 Win+R，输入 cmd，回车
+2. 在命令行窗口输入以下命令并回车：
+   cd /d "你的vault路径\.obsidian\plugins\smart-ime"
+   im-select.exe
+
+3. 记下显示的数字（这是你当前的输入法 ID）
+4. 切换到中文输入法，再次运行 im-select.exe，记下中文输入法 ID
+5. 在 Obsidian 设置 → Smart IME 中填入：
+   - Chinese IME: 中文输入法 ID（通常是 2052）
+   - English IME: 英文输入法 ID（通常是 1033）
+
+完成！现在在 Obsidian 中输入时，插件会自动切换输入法。
+
+插件设置说明（可选）
+--------------------
+在 Obsidian 设置 → 第三方插件 → Smart IME 中可以调整：
+
+- Switch to English in math：进入 `$...$` 或 `$$...$$` 中自动切换到英文（默认开启）
+- Switch to Chinese when leaving math：离开数学环境自动切换到中文（默认开启）
+- Switch to Chinese on newline：插入换行（按 Enter）后自动切换到中文（默认开启）
+- Newline switch delay (ms)：换行后延时再切中文，默认 250 毫秒；若你在这个间隔内立即输入英文（如 d/m），将取消切换
+- Cancel newline switch on ASCII：换行后若输入 ASCII（如字母/数字），取消这次“换行切中文”（默认开启）
+- Space to switch English：中文后输入一个空格自动切换到英文（默认开启）
+- Double space to Chinese：英文状态下、当前行已有中文，且两个空格前为非中文字符时，删除一个末尾空格并切换到中文（默认关闭）
+- Switch by previous character：上一字符为中文则切换到中文（默认开启；仅此规则受节流影响）
+- Switch interval (ms)：以上“上一字符为中文”规则的触发间隔，默认 2000 毫秒
+- Enable cursor color：根据输入法显示不同光标颜色（可选）
+
+高级：手动指定 im-select 路径
+--------------------------------
+- 如果自动探测不到 `im-select`，可以在设置项 `im-select path (optional)` 中填写完整路径：
+  - Windows：如 `C:\\Tools\\im-select.exe`
+  - macOS：如 `/opt/homebrew/bin/im-select`
+- 留空则使用自动探测与系统 PATH。
+
+验证 im-select（推荐）
+---------------------
+- 打开 Obsidian 设置 → 第三方插件 → Smart IME
+- 点击 `Test im-select` 按钮进行自检：
+  - 显示当前使用的 im-select 路径
+  - 显示当前输入法标识（无参数模式）
+  - 校验带参数模式是否可用（不会实际切换输入法）
+- 若校验失败，请确认 im-select 已正确安装，或在 `im-select path (optional)` 中填写完整路径。
+
+提示：若需排查触发顺序或与其他输入相关插件的冲突，可暂时仅保留上述单一规则进行验证，逐项开启定位。
