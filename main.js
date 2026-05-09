@@ -35,8 +35,6 @@ var DEFAULT_SETTINGS = {
   spaceToEnglish: true,
   doubleSpaceToChinese: false,
   switchByPreviousChar: true,
-  autoSwitchBackToChinese: true,
-  englishWordDelay: 3e3,
   chineseIME: "",
   englishIME: "",
   enableCursorColor: true,
@@ -55,16 +53,26 @@ var SmartIMEPlugin = class extends import_obsidian.Plugin {
     // only used for Chinese-char-trigger throttle
     this.currentIME = "";
     this.imSelectPath = "";
-    this.switchBackTimer = null;
-    this.lastInputTime = 0;
     this.newlineTimer = null;
+    this.isSwitchingIME = false;
   }
   async onload() {
     await this.loadSettings();
     await this.detectIMEConfig();
+    const initialIME = await this.obtainCurrentIME();
+    if (initialIME) {
+      this.currentIME = initialIME;
+    }
     this.styleEl = document.createElement("style");
     document.head.appendChild(this.styleEl);
     this.updateCursorStyle();
+    this.statusBarItemEl = this.addStatusBarItem();
+    this.updateStatusBar();
+    this.addCommand({
+      id: "toggle-ime",
+      name: "Toggle IME (\u4E2D/\u82F1)",
+      callback: () => this.toggleIME()
+    });
     this.registerEditorExtension([
       import_view.EditorView.updateListener.of((update) => {
         if (!this.settings.enableAutoSwitch)
@@ -83,15 +91,51 @@ var SmartIMEPlugin = class extends import_obsidian.Plugin {
       this.styleEl.remove();
     }
     this.clearNewlineTimer();
-    this.clearSwitchBackTimer();
   }
   updateCursorStyle() {
     if (!this.settings.enableCursorColor) {
       this.styleEl.textContent = "";
       return;
     }
+    if (!this.settings.chineseIME || !this.settings.englishIME) {
+      this.styleEl.textContent = "";
+      return;
+    }
     const color = this.currentIME === this.settings.chineseIME ? this.settings.chineseCursorColor : this.settings.englishCursorColor;
+    if (!this.isValidCSSColor(color)) {
+      console.warn("Invalid cursor color:", color);
+      return;
+    }
     this.styleEl.textContent = `.cm-cursor { border-left-color: ${color} !important; }`;
+  }
+  updateStatusBar() {
+    if (!this.settings.chineseIME || !this.settings.englishIME) {
+      this.statusBarItemEl.setText("IME: --");
+      return;
+    }
+    const isChinese = this.currentIME === this.settings.chineseIME;
+    this.statusBarItemEl.setText(isChinese ? "\u4E2D" : "EN");
+  }
+  async toggleIME() {
+    if (!this.settings.chineseIME || !this.settings.englishIME) {
+      new import_obsidian.Notice("Please configure Chinese and English IME identifiers first");
+      return;
+    }
+    const target = this.currentIME === this.settings.chineseIME ? "en" : "zh";
+    await this.switchIME(target);
+    new import_obsidian.Notice(target === "zh" ? "\u5207\u6362\u5230\u4E2D\u6587" : "Switched to English");
+  }
+  isValidCSSColor(color) {
+    if (!color)
+      return false;
+    if (/^#([0-9A-Fa-f]{3}|[0-9A-Fa-f]{6}|[0-9A-Fa-f]{8})$/.test(color))
+      return true;
+    const namedColors = /^(transparent|currentcolor|inherit|initial|unset|black|white|red|green|blue|yellow|cyan|magenta|gray|grey|orange|pink|purple|brown)$/i;
+    if (namedColors.test(color))
+      return true;
+    if (/^(rgb|rgba|hsl|hsla)\(\s*[\d.,\s%]+\s*\)$/.test(color))
+      return true;
+    return false;
   }
   async detectIMEConfig() {
     try {
@@ -121,6 +165,23 @@ var SmartIMEPlugin = class extends import_obsidian.Plugin {
         const candidates = [
           "/opt/homebrew/bin/im-select",
           "/usr/local/bin/im-select",
+          `${vaultPath}/.obsidian/plugins/smart-ime/im-select`
+        ];
+        for (const p of candidates) {
+          try {
+            await (0, import_promises.access)(p);
+            this.imSelectPath = p;
+            return;
+          } catch (e) {
+          }
+        }
+        this.imSelectPath = "im-select";
+        return;
+      }
+      if (process.platform === "linux") {
+        const candidates = [
+          "/usr/local/bin/im-select",
+          "/usr/bin/im-select",
           `${vaultPath}/.obsidian/plugins/smart-ime/im-select`
         ];
         for (const p of candidates) {
@@ -183,11 +244,22 @@ current IME: FAILED`;
   }
   handleDocChange(update) {
     const now = Date.now();
-    this.lastInputTime = now;
     const view = update.view;
     const pos = view.state.selection.main.head;
     const line = view.state.doc.lineAt(pos);
     const textBefore = line.text.slice(0, pos - line.from);
+    if (this.isInCodeBlock(view.state.doc, pos)) {
+      return;
+    }
+    let isInsertion = false;
+    update.changes.iterChanges((fromA, toA, fromB, toB, inserted) => {
+      if (inserted && inserted.length > 0) {
+        isInsertion = true;
+      }
+    });
+    if (!isInsertion) {
+      return;
+    }
     if (this.settings.switchToChineseOnNewline) {
       let insertedNewline = false;
       let insertedText = "";
@@ -211,27 +283,27 @@ current IME: FAILED`;
       if (this.newlineTimer && this.settings.newlineCancelOnAscii && /[A-Za-z0-9]/.test(insertedText)) {
         this.clearNewlineTimer();
       }
+      if (this.newlineTimer && this.containsChinese(insertedText)) {
+        this.clearNewlineTimer();
+      }
       if (insertedNewline) {
         this.clearNewlineTimer();
         this.newlineTimer = setTimeout(() => {
           this.switchIME("zh");
-          this.clearSwitchBackTimer();
           this.clearNewlineTimer();
         }, this.settings.newlineSwitchDelayMs);
       }
     }
     const prevPos = update.startState.selection.main.head;
     const prevInMath = this.isInMathContextDoc(update.startState.doc, prevPos);
-    const inMath = this.isInMathContext(view, pos);
+    const inMath = this.isInMathContextDoc(view.state.doc, pos);
     if (this.settings.switchToChineseOnLeaveMath && prevInMath && !inMath) {
       this.switchIME("zh");
-      this.clearSwitchBackTimer();
       this.clearNewlineTimer();
       return;
     }
     if (inMath && this.settings.switchToEnglishInMath) {
       this.switchIME("en");
-      this.clearSwitchBackTimer();
       this.clearNewlineTimer();
       return;
     }
@@ -239,7 +311,7 @@ current IME: FAILED`;
     const lastTwoChars = textBefore.slice(-2);
     if (this.settings.doubleSpaceToChinese && lastTwoChars === "  " && this.currentIME === this.settings.englishIME) {
       const charBeforeSpaces = textBefore.slice(-3, -2);
-      const hasChineseInLine = /[\u4e00-\u9fa5]/.test(textBefore);
+      const hasChineseInLine = this.containsChinese(textBefore);
       if (!this.isChinese(charBeforeSpaces) && hasChineseInLine) {
         const from = pos - 1;
         const to = pos;
@@ -247,7 +319,6 @@ current IME: FAILED`;
           view.dispatch({ changes: { from, to, insert: "" } });
         }
         this.switchIME("zh");
-        this.clearSwitchBackTimer();
         return;
       }
     }
@@ -255,7 +326,6 @@ current IME: FAILED`;
       const charBeforeSpace = textBefore.slice(-2, -1);
       if (this.isChinese(charBeforeSpace)) {
         this.switchIME("en");
-        this.clearSwitchBackTimer();
         return;
       }
     }
@@ -263,7 +333,6 @@ current IME: FAILED`;
       if (now - this.lastCheckTime >= this.settings.switchInterval) {
         this.lastCheckTime = now;
         this.switchIME("zh");
-        this.clearSwitchBackTimer();
       }
     }
   }
@@ -271,16 +340,14 @@ current IME: FAILED`;
     const pos = update.view.state.selection.main.head;
     const prevPos = update.startState.selection.main.head;
     const prevInMath = this.isInMathContextDoc(update.startState.doc, prevPos);
-    const inMath = this.isInMathContext(update.view, pos);
+    const inMath = this.isInMathContextDoc(update.view.state.doc, pos);
     if (this.settings.switchToChineseOnLeaveMath && prevInMath && !inMath) {
       this.switchIME("zh");
-      this.clearSwitchBackTimer();
       this.clearNewlineTimer();
       return;
     }
     if (inMath && this.settings.switchToEnglishInMath) {
       this.switchIME("en");
-      this.clearSwitchBackTimer();
       this.clearNewlineTimer();
       return;
     }
@@ -288,12 +355,13 @@ current IME: FAILED`;
   isInMathContextDoc(doc, pos) {
     const line = doc.lineAt(pos);
     const textBefore = line.text.slice(0, pos - line.from);
-    const dollarCount = (textBefore.match(/\$/g) || []).length;
+    const textWithoutEscaped = textBefore.replace(/\\\$/g, "");
+    const dollarCount = (textWithoutEscaped.match(/\$/g) || []).length;
     if (dollarCount % 2 === 1)
       return true;
     const curLine = line.number;
     let start = -1;
-    for (let i = curLine; i >= Math.max(1, curLine - 400); i--) {
+    for (let i = curLine - 1; i >= Math.max(1, curLine - 400); i--) {
       const t = doc.line(i).text.trim();
       if (t === "$$") {
         start = i;
@@ -303,19 +371,51 @@ current IME: FAILED`;
     if (start !== -1) {
       let end = -1;
       const total = doc.lines || doc.lineCount || 1e6;
-      for (let i = start + 1; i <= Math.min(total, start + 400); i++) {
+      for (let i = curLine + 1; i <= Math.min(total, start + 400); i++) {
         const t = doc.line(i).text.trim();
         if (t === "$$") {
           end = i;
           break;
         }
       }
-      if (end !== -1 && curLine > start && curLine < end)
+      if (end !== -1)
         return true;
     }
     const doubleDollarCount = (textBefore.match(/\$\$/g) || []).length;
     if (doubleDollarCount % 2 === 1)
       return true;
+    return false;
+  }
+  isInCodeBlock(doc, pos) {
+    const line = doc.lineAt(pos);
+    const textBefore = line.text.slice(0, pos - line.from);
+    const backtickCount = (textBefore.match(/`/g) || []).length;
+    const tripleBackticks = (textBefore.match(/```/g) || []).length;
+    const singleBackticks = backtickCount - tripleBackticks * 3;
+    if (singleBackticks % 2 === 1)
+      return true;
+    const curLine = line.number;
+    let start = -1;
+    for (let i = curLine - 1; i >= Math.max(1, curLine - 400); i--) {
+      const t = doc.line(i).text.trim();
+      if (t.startsWith("```")) {
+        start = i;
+        break;
+      }
+    }
+    if (start !== -1) {
+      let end = -1;
+      const total = doc.lines || doc.lineCount || 1e6;
+      for (let i = curLine + 1; i <= Math.min(total, start + 400); i++) {
+        const t = doc.line(i).text.trim();
+        if (t === "```") {
+          end = i;
+          break;
+        }
+      }
+      if (end !== -1)
+        return true;
+    }
     return false;
   }
   clearNewlineTimer() {
@@ -324,64 +424,49 @@ current IME: FAILED`;
       this.newlineTimer = null;
     }
   }
-  clearSwitchBackTimer() {
-    if (this.switchBackTimer) {
-      clearTimeout(this.switchBackTimer);
-      this.switchBackTimer = null;
-    }
-  }
-  isInMathContext(view, pos) {
-    const doc = view.state.doc;
-    const line = doc.lineAt(pos);
-    const textBefore = line.text.slice(0, pos - line.from);
-    const dollarCount = (textBefore.match(/\$/g) || []).length;
-    if (dollarCount % 2 === 1)
-      return true;
-    const curLine = line.number;
-    let start = -1;
-    for (let i = curLine; i >= Math.max(1, curLine - 400); i--) {
-      const t = doc.line(i).text.trim();
-      if (t === "$$") {
-        start = i;
-        break;
-      }
-    }
-    if (start !== -1) {
-      let end = -1;
-      const total = doc.lines || doc.lineCount || 1e6;
-      for (let i = start + 1; i <= Math.min(total, start + 400); i++) {
-        const t = doc.line(i).text.trim();
-        if (t === "$$") {
-          end = i;
-          break;
-        }
-      }
-      if (end !== -1 && curLine > start && curLine < end)
-        return true;
-    }
-    const doubleDollarCount = (textBefore.match(/\$\$/g) || []).length;
-    if (doubleDollarCount % 2 === 1)
-      return true;
-    return false;
-  }
   isChinese(char) {
     if (!char)
       return false;
-    const code = char.charCodeAt(0);
-    return code >= 19968 && code <= 40959 || code >= 13312 && code <= 19903 || code >= 131072 && code <= 173791;
+    const code = char.codePointAt(0);
+    if (code === void 0)
+      return false;
+    if (code >= 19968 && code <= 40959)
+      return true;
+    if (code >= 13312 && code <= 19903)
+      return true;
+    if (code >= 131072 && code <= 173791)
+      return true;
+    if (code >= 12288 && code <= 12351)
+      return true;
+    if (code >= 65280 && code <= 65519)
+      return true;
+    return false;
+  }
+  containsChinese(text) {
+    for (const char of text) {
+      if (this.isChinese(char))
+        return true;
+    }
+    return false;
   }
   async switchIME(target) {
     const targetIME = target === "zh" ? this.settings.chineseIME : this.settings.englishIME;
     if (!targetIME || this.currentIME === targetIME)
       return;
+    if (this.isSwitchingIME)
+      return;
+    this.isSwitchingIME = true;
     try {
       const custom = (this.settings.imSelectCustomPath || "").trim();
       const exe = custom.length > 0 ? custom : this.imSelectPath && this.imSelectPath.length > 0 ? this.imSelectPath : process.platform === "win32" ? `${this.app.vault.adapter.basePath}\\.obsidian\\plugins\\smart-ime\\im-select.exe` : "im-select";
       await execFileAsync(exe, [targetIME]);
       this.currentIME = targetIME;
       this.updateCursorStyle();
+      this.updateStatusBar();
     } catch (e) {
       console.error("Failed to switch IME:", e);
+    } finally {
+      this.isSwitchingIME = false;
     }
   }
   async loadSettings() {
@@ -464,17 +549,6 @@ var SmartIMESettingTab = class extends import_obsidian.PluginSettingTab {
     new import_obsidian.Setting(containerEl).setName("Switch by previous character").setDesc("Auto switch based on last typed character").addToggle((toggle) => toggle.setValue(this.plugin.settings.switchByPreviousChar).onChange(async (value) => {
       this.plugin.settings.switchByPreviousChar = value;
       await this.plugin.saveSettings();
-    }));
-    new import_obsidian.Setting(containerEl).setName("Auto switch back to Chinese").setDesc("Automatically switch back to Chinese after typing English").addToggle((toggle) => toggle.setValue(this.plugin.settings.autoSwitchBackToChinese).onChange(async (value) => {
-      this.plugin.settings.autoSwitchBackToChinese = value;
-      await this.plugin.saveSettings();
-    }));
-    new import_obsidian.Setting(containerEl).setName("English word delay (ms)").setDesc("Time to wait before switching back to Chinese").addText((text) => text.setValue(String(this.plugin.settings.englishWordDelay)).onChange(async (value) => {
-      const num = parseInt(value);
-      if (!isNaN(num) && num > 0) {
-        this.plugin.settings.englishWordDelay = num;
-        await this.plugin.saveSettings();
-      }
     }));
     new import_obsidian.Setting(containerEl).setName("Enable cursor color").setDesc("Show different cursor colors for different IME states").addToggle((toggle) => toggle.setValue(this.plugin.settings.enableCursorColor).onChange(async (value) => {
       this.plugin.settings.enableCursorColor = value;

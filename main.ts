@@ -52,6 +52,7 @@ export default class SmartIMEPlugin extends Plugin {
 	private styleEl: HTMLStyleElement;
 	private newlineTimer: NodeJS.Timeout | null = null;
 	private isSwitchingIME: boolean = false;
+	private statusBarItemEl: HTMLElement;
 
 	async onload() {
 		await this.loadSettings();
@@ -66,6 +67,15 @@ export default class SmartIMEPlugin extends Plugin {
 		this.styleEl = document.createElement('style');
 		document.head.appendChild(this.styleEl);
 		this.updateCursorStyle();
+
+		this.statusBarItemEl = this.addStatusBarItem();
+		this.updateStatusBar();
+
+		this.addCommand({
+			id: 'toggle-ime',
+			name: 'Toggle IME (中/英)',
+			callback: () => this.toggleIME(),
+		});
 
 		this.registerEditorExtension([
 			EditorView.updateListener.of((update) => {
@@ -107,6 +117,25 @@ export default class SmartIMEPlugin extends Plugin {
 			return;
 		}
 		this.styleEl.textContent = `.cm-cursor { border-left-color: ${color} !important; }`;
+	}
+
+	updateStatusBar() {
+		if (!this.settings.chineseIME || !this.settings.englishIME) {
+			this.statusBarItemEl.setText('IME: --');
+			return;
+		}
+		const isChinese = this.currentIME === this.settings.chineseIME;
+		this.statusBarItemEl.setText(isChinese ? '中' : 'EN');
+	}
+
+	private async toggleIME() {
+		if (!this.settings.chineseIME || !this.settings.englishIME) {
+			new Notice('Please configure Chinese and English IME identifiers first');
+			return;
+		}
+		const target = this.currentIME === this.settings.chineseIME ? 'en' : 'zh';
+		await this.switchIME(target);
+		new Notice(target === 'zh' ? '切换到中文' : 'Switched to English');
 	}
 
 	private isValidCSSColor(color: string): boolean {
@@ -464,6 +493,7 @@ export default class SmartIMEPlugin extends Plugin {
 			await execFileAsync(exe, [targetIME]);
 			this.currentIME = targetIME;
 			this.updateCursorStyle();
+			this.updateStatusBar();
 		} catch (e) {
 			console.error('Failed to switch IME:', e);
 		} finally {
