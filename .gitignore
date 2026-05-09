@@ -6,3 +6,4 @@ third_party/
 plugins/
 im-select.exe
 im-select
+.claude/

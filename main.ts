@@ -1,6 +1,5 @@
 import { App, Plugin, PluginSettingTab, Setting, Notice } from 'obsidian';
-import { EditorView, Decoration, DecorationSet, ViewPlugin, ViewUpdate } from '@codemirror/view';
-import { StateField, StateEffect } from '@codemirror/state';
+import { EditorView, ViewUpdate } from '@codemirror/view';
 import { execFile } from 'child_process';
 import { access } from 'fs/promises';
 import { promisify } from 'util';
@@ -14,18 +13,16 @@ interface SmartIMESettings {
 	spaceToEnglish: boolean;
 	doubleSpaceToChinese: boolean;
 	switchByPreviousChar: boolean;
-	autoSwitchBackToChinese: boolean;
-	englishWordDelay: number;
 	chineseIME: string;
 	englishIME: string;
 	enableCursorColor: boolean;
 	chineseCursorColor: string;
 	englishCursorColor: string;
-    switchToChineseOnNewline: boolean;
-    switchToChineseOnLeaveMath: boolean;
-    imSelectCustomPath: string;
-    newlineSwitchDelayMs: number;
-    newlineCancelOnAscii: boolean;
+	switchToChineseOnNewline: boolean;
+	switchToChineseOnLeaveMath: boolean;
+	imSelectCustomPath: string;
+	newlineSwitchDelayMs: number;
+	newlineCancelOnAscii: boolean;
 }
 
 const DEFAULT_SETTINGS: SmartIMESettings = {
@@ -35,18 +32,16 @@ const DEFAULT_SETTINGS: SmartIMESettings = {
 	spaceToEnglish: true,
 	doubleSpaceToChinese: false,
 	switchByPreviousChar: true,
-	autoSwitchBackToChinese: true,
-	englishWordDelay: 3000,
 	chineseIME: '',
 	englishIME: '',
 	enableCursorColor: true,
 	chineseCursorColor: '#ff0000',
 	englishCursorColor: '#000000',
-    switchToChineseOnNewline: true,
-    switchToChineseOnLeaveMath: true,
-    imSelectCustomPath: '',
-    newlineSwitchDelayMs: 250,
-    newlineCancelOnAscii: true,
+	switchToChineseOnNewline: true,
+	switchToChineseOnLeaveMath: true,
+	imSelectCustomPath: '',
+	newlineSwitchDelayMs: 250,
+	newlineCancelOnAscii: true,
 }
 
 export default class SmartIMEPlugin extends Plugin {
@@ -55,13 +50,18 @@ export default class SmartIMEPlugin extends Plugin {
 	private currentIME: string = '';
 	private imSelectPath: string = '';
 	private styleEl: HTMLStyleElement;
-	private switchBackTimer: NodeJS.Timeout | null = null;
-	private lastInputTime: number = 0;
-    private newlineTimer: NodeJS.Timeout | null = null;
+	private newlineTimer: NodeJS.Timeout | null = null;
+	private isSwitchingIME: boolean = false;
 
 	async onload() {
 		await this.loadSettings();
 		await this.detectIMEConfig();
+
+		// Initialize currentIME with actual system state
+		const initialIME = await this.obtainCurrentIME();
+		if (initialIME) {
+			this.currentIME = initialIME;
+		}
 
 		this.styleEl = document.createElement('style');
 		document.head.appendChild(this.styleEl);
@@ -86,7 +86,6 @@ export default class SmartIMEPlugin extends Plugin {
 			this.styleEl.remove();
 		}
 		this.clearNewlineTimer();
-		this.clearSwitchBackTimer();
 	}
 
 	updateCursorStyle() {
@@ -94,10 +93,32 @@ export default class SmartIMEPlugin extends Plugin {
 			this.styleEl.textContent = '';
 			return;
 		}
+		// Skip if IME not configured
+		if (!this.settings.chineseIME || !this.settings.englishIME) {
+			this.styleEl.textContent = '';
+			return;
+		}
 		const color = this.currentIME === this.settings.chineseIME
 			? this.settings.chineseCursorColor
 			: this.settings.englishCursorColor;
+		// Validate color to prevent CSS injection
+		if (!this.isValidCSSColor(color)) {
+			console.warn('Invalid cursor color:', color);
+			return;
+		}
 		this.styleEl.textContent = `.cm-cursor { border-left-color: ${color} !important; }`;
+	}
+
+	private isValidCSSColor(color: string): boolean {
+		if (!color) return false;
+		// Allow hex colors: #RGB, #RRGGBB, #RRGGBBAA
+		if (/^#([0-9A-Fa-f]{3}|[0-9A-Fa-f]{6}|[0-9A-Fa-f]{8})$/.test(color)) return true;
+		// Allow named colors (common ones)
+		const namedColors = /^(transparent|currentcolor|inherit|initial|unset|black|white|red|green|blue|yellow|cyan|magenta|gray|grey|orange|pink|purple|brown)$/i;
+		if (namedColors.test(color)) return true;
+		// Allow rgb/rgba/hsl/hsla with numbers only
+		if (/^(rgb|rgba|hsl|hsla)\(\s*[\d.,\s%]+\s*\)$/.test(color)) return true;
+		return false;
 	}
 
 	private async detectIMEConfig() {
@@ -120,6 +141,19 @@ export default class SmartIMEPlugin extends Plugin {
 				const candidates = [
 					'/opt/homebrew/bin/im-select',
 					'/usr/local/bin/im-select',
+					`${vaultPath}/.obsidian/plugins/smart-ime/im-select`,
+				];
+				for (const p of candidates) {
+					try { await access(p); this.imSelectPath = p; return; } catch {}
+				}
+				this.imSelectPath = 'im-select'; // fallback to PATH
+				return;
+			}
+			// Linux
+			if (process.platform === 'linux') {
+				const candidates = [
+					'/usr/local/bin/im-select',
+					'/usr/bin/im-select',
 					`${vaultPath}/.obsidian/plugins/smart-ime/im-select`,
 				];
 				for (const p of candidates) {
@@ -177,13 +211,28 @@ export default class SmartIMEPlugin extends Plugin {
 
 	private handleDocChange(update: ViewUpdate) {
 		const now = Date.now();
-		this.lastInputTime = now;
 
 		const view = update.view;
 
 		const pos = view.state.selection.main.head;
 		const line = view.state.doc.lineAt(pos);
 		const textBefore = line.text.slice(0, pos - line.from);
+
+		// Skip if in code block
+		if (this.isInCodeBlock(view.state.doc as any, pos)) {
+			return;
+		}
+
+		// Skip if this is a deletion (no text inserted)
+		let isInsertion = false;
+		update.changes.iterChanges((fromA, toA, fromB, toB, inserted) => {
+			if (inserted && inserted.length > 0) {
+				isInsertion = true;
+			}
+		});
+		if (!isInsertion) {
+			return;
+		}
 
 		// Newline to Chinese (smart, delayed)
 		if (this.settings.switchToChineseOnNewline) {
@@ -209,11 +258,14 @@ export default class SmartIMEPlugin extends Plugin {
 			if (this.newlineTimer && this.settings.newlineCancelOnAscii && /[A-Za-z0-9]/.test(insertedText)) {
 				this.clearNewlineTimer();
 			}
+			// cancel pending newline if user typed Chinese (user already in Chinese mode)
+			if (this.newlineTimer && this.containsChinese(insertedText)) {
+				this.clearNewlineTimer();
+			}
 			if (insertedNewline) {
 				this.clearNewlineTimer();
 				this.newlineTimer = setTimeout(() => {
 					this.switchIME('zh');
-					this.clearSwitchBackTimer();
 					this.clearNewlineTimer();
 				}, this.settings.newlineSwitchDelayMs);
 			}
@@ -222,17 +274,15 @@ export default class SmartIMEPlugin extends Plugin {
 		// Check if in math context
 		const prevPos = update.startState.selection.main.head;
 		const prevInMath = this.isInMathContextDoc(update.startState.doc as any, prevPos);
-		const inMath = this.isInMathContext(view, pos);
+		const inMath = this.isInMathContextDoc(view.state.doc as any, pos);
 		// Leaving math context → switch to Chinese
 		if (this.settings.switchToChineseOnLeaveMath && prevInMath && !inMath) {
 			this.switchIME('zh');
-			this.clearSwitchBackTimer();
 			this.clearNewlineTimer();
 			return;
 		}
 		if (inMath && this.settings.switchToEnglishInMath) {
 			this.switchIME('en');
-			this.clearSwitchBackTimer();
 			this.clearNewlineTimer();
 			return;
 		}
@@ -253,7 +303,7 @@ export default class SmartIMEPlugin extends Plugin {
 			this.currentIME === this.settings.englishIME
 		) {
 			const charBeforeSpaces = textBefore.slice(-3, -2);
-			const hasChineseInLine = /[\u4e00-\u9fa5]/.test(textBefore);
+			const hasChineseInLine = this.containsChinese(textBefore);
 			if (!this.isChinese(charBeforeSpaces) && hasChineseInLine) {
 				// delete one trailing space
 				const from = pos - 1;
@@ -262,7 +312,6 @@ export default class SmartIMEPlugin extends Plugin {
 					view.dispatch({ changes: { from, to, insert: '' } });
 				}
 				this.switchIME('zh');
-				this.clearSwitchBackTimer();
 				return;
 			}
 		}
@@ -272,7 +321,6 @@ export default class SmartIMEPlugin extends Plugin {
 			const charBeforeSpace = textBefore.slice(-2, -1);
 			if (this.isChinese(charBeforeSpace)) {
 				this.switchIME('en');
-				this.clearSwitchBackTimer();
 				return;
 			}
 		}
@@ -282,7 +330,6 @@ export default class SmartIMEPlugin extends Plugin {
 			if (now - this.lastCheckTime >= this.settings.switchInterval) {
 				this.lastCheckTime = now;
 				this.switchIME('zh');
-				this.clearSwitchBackTimer();
 			}
 		}
 	}
@@ -291,18 +338,16 @@ export default class SmartIMEPlugin extends Plugin {
 		const pos = update.view.state.selection.main.head;
 		const prevPos = update.startState.selection.main.head;
 		const prevInMath = this.isInMathContextDoc(update.startState.doc as any, prevPos);
-		const inMath = this.isInMathContext(update.view, pos);
+		const inMath = this.isInMathContextDoc(update.view.state.doc as any, pos);
 		// Leaving math → Chinese
 		if (this.settings.switchToChineseOnLeaveMath && prevInMath && !inMath) {
 			this.switchIME('zh');
-			this.clearSwitchBackTimer();
 			this.clearNewlineTimer();
 			return;
 		}
 		// Entering math → English
 		if (inMath && this.settings.switchToEnglishInMath) {
 			this.switchIME('en');
-			this.clearSwitchBackTimer();
 			this.clearNewlineTimer();
 			return;
 		}
@@ -311,28 +356,60 @@ export default class SmartIMEPlugin extends Plugin {
 	private isInMathContextDoc(doc: any, pos: number): boolean {
 		const line = doc.lineAt(pos);
 		const textBefore = line.text.slice(0, pos - line.from);
+		// Remove escaped \$ before counting
+		const textWithoutEscaped = textBefore.replace(/\\\$/g, '');
 		// Inline math $...$
-		const dollarCount = (textBefore.match(/\$/g) || []).length;
+		const dollarCount = (textWithoutEscaped.match(/\$/g) || []).length;
 		if (dollarCount % 2 === 1) return true;
 		// Display math $$...$$ spanning multiple lines: find nearest $$ above and below
 		const curLine = line.number;
 		let start = -1;
-		for (let i = curLine; i >= Math.max(1, curLine - 400); i--) {
+		// Search from previous line to avoid matching current line's $$
+		for (let i = curLine - 1; i >= Math.max(1, curLine - 400); i--) {
 			const t = doc.line(i).text.trim();
 			if (t === '$$') { start = i; break; }
 		}
 		if (start !== -1) {
 			let end = -1;
 			const total = (doc as any).lines || (doc as any).lineCount || 1000000;
-			for (let i = start + 1; i <= Math.min(total, start + 400); i++) {
+			// Search from next line
+			for (let i = curLine + 1; i <= Math.min(total, start + 400); i++) {
 				const t = doc.line(i).text.trim();
 				if (t === '$$') { end = i; break; }
 			}
-			if (end !== -1 && curLine > start && curLine < end) return true;
+			if (end !== -1) return true;
 		}
 		// Fallback: $$ before cursor on current line (rare)
 		const doubleDollarCount = (textBefore.match(/\$\$/g) || []).length;
 		if (doubleDollarCount % 2 === 1) return true;
+		return false;
+	}
+
+	private isInCodeBlock(doc: any, pos: number): boolean {
+		const line = doc.lineAt(pos);
+		const textBefore = line.text.slice(0, pos - line.from);
+		// Inline code `...`
+		const backtickCount = (textBefore.match(/`/g) || []).length;
+		// Exclude triple backticks from count
+		const tripleBackticks = (textBefore.match(/```/g) || []).length;
+		const singleBackticks = backtickCount - tripleBackticks * 3;
+		if (singleBackticks % 2 === 1) return true;
+		// Fenced code block ```...```
+		const curLine = line.number;
+		let start = -1;
+		for (let i = curLine - 1; i >= Math.max(1, curLine - 400); i--) {
+			const t = doc.line(i).text.trim();
+			if (t.startsWith('```')) { start = i; break; }
+		}
+		if (start !== -1) {
+			let end = -1;
+			const total = (doc as any).lines || (doc as any).lineCount || 1000000;
+			for (let i = curLine + 1; i <= Math.min(total, start + 400); i++) {
+				const t = doc.line(i).text.trim();
+				if (t === '```') { end = i; break; }
+			}
+			if (end !== -1) return true;
+		}
 		return false;
 	}
 
@@ -343,57 +420,37 @@ export default class SmartIMEPlugin extends Plugin {
 		}
 	}
 
-	private clearSwitchBackTimer() {
-		if (this.switchBackTimer) {
-			clearTimeout(this.switchBackTimer);
-			this.switchBackTimer = null;
-		}
-	}
-
-	private isInMathContext(view: EditorView, pos: number): boolean {
-		const doc = view.state.doc;
-		const line = doc.lineAt(pos);
-		const textBefore = line.text.slice(0, pos - line.from);
-
-		// Inline math $...$
-		const dollarCount = (textBefore.match(/\$/g) || []).length;
-		if (dollarCount % 2 === 1) return true;
-
-		// Display math $$...$$ spanning multiple lines: find nearest $$ above and below
-		const curLine = line.number;
-		let start = -1;
-		for (let i = curLine; i >= Math.max(1, curLine - 400); i--) {
-			const t = doc.line(i).text.trim();
-			if (t === '$$') { start = i; break; }
-		}
-		if (start !== -1) {
-			let end = -1;
-			const total = (doc as any).lines || (doc as any).lineCount || 1000000;
-			for (let i = start + 1; i <= Math.min(total, start + 400); i++) {
-				const t = doc.line(i).text.trim();
-				if (t === '$$') { end = i; break; }
-			}
-			if (end !== -1 && curLine > start && curLine < end) return true;
-		}
-
-		// Fallback: $$ before cursor on current line (rare)
-		const doubleDollarCount = (textBefore.match(/\$\$/g) || []).length;
-		if (doubleDollarCount % 2 === 1) return true;
-
+	private isChinese(char: string): boolean {
+		if (!char) return false;
+		const code = char.codePointAt(0);
+		if (code === undefined) return false;
+		// CJK Unified Ideographs
+		if (code >= 0x4E00 && code <= 0x9FFF) return true;
+		// CJK Extension A
+		if (code >= 0x3400 && code <= 0x4DBF) return true;
+		// CJK Extension B
+		if (code >= 0x20000 && code <= 0x2A6DF) return true;
+		// Chinese punctuation (，。！？、；：""''【】等)
+		if (code >= 0x3000 && code <= 0x303F) return true;
+		// Fullwidth punctuation (！＂＃等)
+		if (code >= 0xFF00 && code <= 0xFFEF) return true;
 		return false;
 	}
 
-	private isChinese(char: string): boolean {
-		if (!char) return false;
-		const code = char.charCodeAt(0);
-		return (code >= 0x4E00 && code <= 0x9FFF) ||
-		       (code >= 0x3400 && code <= 0x4DBF) ||
-		       (code >= 0x20000 && code <= 0x2A6DF);
+	private containsChinese(text: string): boolean {
+		for (const char of text) {
+			if (this.isChinese(char)) return true;
+		}
+		return false;
 	}
 
 	private async switchIME(target: 'zh' | 'en') {
 		const targetIME = target === 'zh' ? this.settings.chineseIME : this.settings.englishIME;
 		if (!targetIME || this.currentIME === targetIME) return;
+
+		// Prevent concurrent IME switches
+		if (this.isSwitchingIME) return;
+		this.isSwitchingIME = true;
 
 		try {
 			const custom = (this.settings.imSelectCustomPath || '').trim();
@@ -409,6 +466,8 @@ export default class SmartIMEPlugin extends Plugin {
 			this.updateCursorStyle();
 		} catch (e) {
 			console.error('Failed to switch IME:', e);
+		} finally {
+			this.isSwitchingIME = false;
 		}
 	}
 
@@ -576,29 +635,6 @@ class SmartIMESettingTab extends PluginSettingTab {
 				.onChange(async (value) => {
 					this.plugin.settings.switchByPreviousChar = value;
 					await this.plugin.saveSettings();
-				}));
-
-		new Setting(containerEl)
-			.setName('Auto switch back to Chinese')
-			.setDesc('Automatically switch back to Chinese after typing English')
-			.addToggle(toggle => toggle
-				.setValue(this.plugin.settings.autoSwitchBackToChinese)
-				.onChange(async (value) => {
-					this.plugin.settings.autoSwitchBackToChinese = value;
-					await this.plugin.saveSettings();
-				}));
-
-		new Setting(containerEl)
-			.setName('English word delay (ms)')
-			.setDesc('Time to wait before switching back to Chinese')
-			.addText(text => text
-				.setValue(String(this.plugin.settings.englishWordDelay))
-				.onChange(async (value) => {
-					const num = parseInt(value);
-					if (!isNaN(num) && num > 0) {
-						this.plugin.settings.englishWordDelay = num;
-						await this.plugin.saveSettings();
-					}
 				}));
 
 		new Setting(containerEl)
