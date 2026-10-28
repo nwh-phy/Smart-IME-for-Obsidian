@@ -1,11 +1,12 @@
 Smart IME for Obsidian - 安装说明
 =====================================
 
-所有命令行操作已完成！现在只需要简单的鼠标操作：
+提示：插件上架社区市场后，可直接在 设置 → 第三方插件 → 浏览 中搜索 "Smart IME" 安装，
+然后跳到步骤 3。市场安装不会附带 im-select，仍需完成步骤 1，并把 im-select.exe 放进插件目录。
 
 步骤 1：下载 im-select.exe
 --------------------------
-1. 打开浏览器访问：https://github.com/daipeihust/im-select/raw/master/win/out/x64/im-select.exe
+1. 打开 https://github.com/daipeihust/im-select#windows ，按说明下载 im-select.exe（64 位系统选 x64 版本）
 2. 文件会自动下载到你的"下载"文件夹
 
 步骤 2：安装插件到 Obsidian
@@ -14,14 +15,16 @@ Smart IME for Obsidian - 安装说明
 2. 进入 .obsidian 文件夹（如果看不到，需要在文件管理器中显示隐藏文件）
 3. 进入 plugins 文件夹（没有就新建一个）
 4. 新建文件夹 smart-ime
-5. 将以下文件复制到 smart-ime 文件夹：
-   - C:\Users\HP\Desktop\vibecoding\smart-ime-for-ob\main.js
-   - C:\Users\HP\Desktop\vibecoding\smart-ime-for-ob\manifest.json
+5. 将以下文件复制到 smart-ime 文件夹（前三个从 GitHub Release 下载，或在本项目目录运行 npm run build 后获得）：
+   - main.js
+   - manifest.json
+   - styles.css
    - 你下载的 im-select.exe
 
 （macOS）
 -------
 1. 使用 Homebrew 安装依赖：
+   brew tap daipeihust/tap
    brew install im-select
 2. 插件会自动在以下位置查找 im-select：
    - /opt/homebrew/bin/im-select（Apple Silicon）
@@ -66,7 +69,7 @@ Smart IME for Obsidian - 安装说明
 - Double space to Chinese：英文状态下、当前行已有中文，且两个空格前为非中文字符时，删除一个末尾空格并切换到中文（默认关闭）
 - Switch by previous character：上一字符为中文则切换到中文（默认开启；仅此规则受节流影响）
 - Switch interval (ms)：以上“上一字符为中文”规则的触发间隔，默认 2000 毫秒
-- Enable cursor color：根据输入法显示不同光标颜色（可选）
+- Enable cursor color：根据输入法显示不同光标颜色（可选）；Chinese/English cursor color 留空则使用主题自带的光标颜色（暗色主题下更清楚）
 
 高级：手动指定 im-select 路径
 --------------------------------

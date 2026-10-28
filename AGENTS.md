@@ -9,7 +9,8 @@
 ## Build, Test, and Development Commands
 - `npm run dev` — esbuild watch; rebuilds `main.js` on changes.
 - `npm run build` — type-checks with `tsc` (no emit) and bundles with esbuild to `main.js`.
-- Local run: copy `main.js` and `manifest.json` to your vault at `.obsidian/plugins/smart-ime/`, then enable in Obsidian.
+- Local run: copy `main.js`, `manifest.json` and `styles.css` to your vault at `.obsidian/plugins/smart-ime/`, then enable in Obsidian.
+- Release: `npm version patch` (syncs `manifest.json`/`versions.json`, tags without `v`), then push the tag; GitHub Actions creates a draft release.
 
 ## Coding Style & Naming Conventions
 - Language: TypeScript (ES2018, CommonJS bundle). Prefer explicit types; avoid `any`.

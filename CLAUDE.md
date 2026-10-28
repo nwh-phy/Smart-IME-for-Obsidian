@@ -32,18 +32,25 @@ npm run build        # Production build (TypeScript check + esbuild)
 4. Single space after Chinese character → switch to English
 5. Previous character is Chinese (throttled) → switch to Chinese
 
-**Math context detection**: Counts `$` symbols before cursor; for display math (`$$`), scans up to 400 lines above/below to find matching delimiters.
+**Context detection** (`getEditContext`): Uses Obsidian's markdown syntax tree (`@codemirror/language`, external at runtime). Obsidian's tree is flat; token node names are the HyperMD style string with spaces → underscores (e.g. `formatting_formatting-math_formatting-math-begin_keyword_math_math-block`, `hmd-codeblock_HyperMD-codeblock-end`). Current-line `$`/backtick parity covers delimiters typed but not yet closed.
+
+**IME state**: `currentIME` is a cache trusted for `IME_CACHE_TTL_MS`; after that `applyIME` re-reads the real IME before skipping a switch. Switch requests are coalesced (latest target wins), never dropped. Only typing updates in the focused view, outside IME composition, trigger rules.
 
 **Platform handling**: Auto-detects `im-select` path on Windows (plugin directory or PATH) and macOS (Homebrew paths or PATH). Custom path configurable in settings.
 
 ## Output Files
 
 - `main.js` - Bundled plugin output (committed for distribution)
-- `manifest.json` - Obsidian plugin manifest
+- `manifest.json` - Obsidian plugin manifest (id `smart-ime`; must not contain "obsidian")
+- `styles.css` - Cursor color rule (variable set on `<body>` of each window)
+
+## Releasing
+
+`npm version patch|minor|major` bumps `package.json`, syncs `manifest.json`/`versions.json` (via `version-bump.mjs`) and creates a git tag without a `v` prefix (`.npmrc`). Pushing the tag runs `.github/workflows/release.yml`, which builds and creates a draft release with `main.js`, `manifest.json`, `styles.css`.
 
 ## Testing
 
 No automated tests. Manual testing requires:
-1. Copy `main.js`, `manifest.json`, and `im-select.exe` to `.obsidian/plugins/smart-ime/`
+1. Copy `main.js`, `manifest.json`, `styles.css`, and `im-select.exe` to `.obsidian/plugins/smart-ime/`
 2. Enable plugin in Obsidian
 3. Use "Test im-select" button in settings to verify IME tool works

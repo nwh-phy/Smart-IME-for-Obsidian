@@ -1,0 +1,5 @@
+/* Cursor color by IME state. The plugin toggles the class and sets the color
+   variable on <body> of every Obsidian window. */
+body.smart-ime-cursor .cm-editor .cm-cursor {
+	border-left-color: var(--smart-ime-cursor-color) !important;
+}

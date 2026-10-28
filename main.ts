@@ -1,10 +1,21 @@
-import { App, Plugin, PluginSettingTab, Setting, Notice } from 'obsidian';
+import { App, FileSystemAdapter, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
 import { EditorView, ViewUpdate } from '@codemirror/view';
+import { EditorState } from '@codemirror/state';
+import { ensureSyntaxTree, syntaxTree } from '@codemirror/language';
 import { execFile } from 'child_process';
 import { access } from 'fs/promises';
+import * as path from 'path';
 import { promisify } from 'util';
 
 const execFileAsync = promisify(execFile);
+
+// Trust the cached IME state for this long; after that, re-check with im-select
+// before skipping a switch, since the user may have toggled the IME manually.
+const IME_CACHE_TTL_MS = 1000;
+const IM_SELECT_TIMEOUT_MS = 2000;
+
+type IMETarget = 'zh' | 'en';
+type EditContext = 'code' | 'math' | 'text';
 
 interface SmartIMESettings {
 	enableAutoSwitch: boolean;
@@ -36,7 +47,7 @@ const DEFAULT_SETTINGS: SmartIMESettings = {
 	englishIME: '',
 	enableCursorColor: true,
 	chineseCursorColor: '#ff0000',
-	englishCursorColor: '#000000',
+	englishCursorColor: '', // empty = theme default
 	switchToChineseOnNewline: true,
 	switchToChineseOnLeaveMath: true,
 	imSelectCustomPath: '',
@@ -48,28 +59,33 @@ export default class SmartIMEPlugin extends Plugin {
 	settings: SmartIMESettings;
 	private lastCheckTime: number = 0; // only used for Chinese-char-trigger throttle
 	private currentIME: string = '';
+	private currentIMEAt: number = 0; // when currentIME was last confirmed
+	private imeStateVersion: number = 0;
 	private imSelectPath: string = '';
-	private styleEl: HTMLStyleElement;
-	private newlineTimer: NodeJS.Timeout | null = null;
-	private isSwitchingIME: boolean = false;
+	private imSelectFailureNotified: boolean = false;
+	private newlineTimer: number | null = null;
+	private pendingTarget: IMETarget | null = null;
+	private switchLoop: Promise<boolean> | null = null;
 	private statusBarItemEl: HTMLElement;
+	private styledDocs = new Set<Document>();
 
 	async onload() {
 		await this.loadSettings();
-		await this.detectIMEConfig();
-
-		// Initialize currentIME with actual system state
-		const initialIME = await this.obtainCurrentIME();
-		if (initialIME) {
-			this.currentIME = initialIME;
-		}
-
-		this.styleEl = document.createElement('style');
-		document.head.appendChild(this.styleEl);
-		this.updateCursorStyle();
 
 		this.statusBarItemEl = this.addStatusBarItem();
 		this.updateStatusBar();
+
+		// Cursor color is applied per window so popout windows get it too
+		this.styledDocs.add(document);
+		this.registerEvent(this.app.workspace.on('window-open', (win) => {
+			this.styledDocs.add(win.doc);
+			this.updateCursorStyle();
+		}));
+		this.registerEvent(this.app.workspace.on('window-close', (win) => {
+			this.clearCursorStyle(win.doc);
+			this.styledDocs.delete(win.doc);
+		}));
+		this.updateCursorStyle();
 
 		this.addCommand({
 			id: 'toggle-ime',
@@ -80,52 +96,69 @@ export default class SmartIMEPlugin extends Plugin {
 		this.registerEditorExtension([
 			EditorView.updateListener.of((update) => {
 				if (!this.settings.enableAutoSwitch) return;
+				// Ignore background views (e.g. the same note open in another pane)
+				// and never switch IME in the middle of a composition
+				if (!update.view.hasFocus || update.view.composing) return;
 				if (update.docChanged) {
-					this.handleDocChange(update);
+					if (this.isTypingUpdate(update)) this.handleDocChange(update);
 				} else if (update.selectionSet) {
 					this.handleSelectionUpdate(update);
 				}
 			})
 		]);
 
+		// The IME may have been changed in another app while Obsidian was in the background
+		this.registerDomEvent(window, 'focus', () => { void this.syncCurrentIME(); });
+
 		this.addSettingTab(new SmartIMESettingTab(this.app, this));
+
+		// Spawning im-select is slow; keep it off the plugin load path
+		this.app.workspace.onLayoutReady(async () => {
+			await this.detectIMEConfig();
+			await this.syncCurrentIME();
+		});
 	}
 
 	onunload() {
-		if (this.styleEl) {
-			this.styleEl.remove();
-		}
 		this.clearNewlineTimer();
+		for (const doc of this.styledDocs) {
+			this.clearCursorStyle(doc);
+		}
+		this.styledDocs.clear();
 	}
 
 	updateCursorStyle() {
-		if (!this.settings.enableCursorColor) {
-			this.styleEl.textContent = '';
-			return;
+		const { enableCursorColor, chineseIME, englishIME } = this.settings;
+		let color = '';
+		if (enableCursorColor && chineseIME && englishIME) {
+			if (this.currentIME === chineseIME) color = this.settings.chineseCursorColor.trim();
+			else if (this.currentIME === englishIME) color = this.settings.englishCursorColor.trim();
 		}
-		// Skip if IME not configured
-		if (!this.settings.chineseIME || !this.settings.englishIME) {
-			this.styleEl.textContent = '';
-			return;
+		// Empty or invalid color → fall back to the theme's cursor color
+		if (!this.isValidCSSColor(color)) color = '';
+		for (const doc of this.styledDocs) {
+			if (color) {
+				doc.body.classList.add('smart-ime-cursor');
+				doc.body.style.setProperty('--smart-ime-cursor-color', color);
+			} else {
+				this.clearCursorStyle(doc);
+			}
 		}
-		const color = this.currentIME === this.settings.chineseIME
-			? this.settings.chineseCursorColor
-			: this.settings.englishCursorColor;
-		// Validate color to prevent CSS injection
-		if (!this.isValidCSSColor(color)) {
-			console.warn('Invalid cursor color:', color);
-			return;
-		}
-		this.styleEl.textContent = `.cm-cursor { border-left-color: ${color} !important; }`;
+	}
+
+	private clearCursorStyle(doc: Document) {
+		doc.body.classList.remove('smart-ime-cursor');
+		doc.body.style.removeProperty('--smart-ime-cursor-color');
 	}
 
 	updateStatusBar() {
-		if (!this.settings.chineseIME || !this.settings.englishIME) {
-			this.statusBarItemEl.setText('IME: --');
-			return;
+		const { chineseIME, englishIME } = this.settings;
+		let label = 'IME: --';
+		if (chineseIME && englishIME) {
+			if (this.currentIME === chineseIME) label = '中';
+			else if (this.currentIME === englishIME) label = 'EN';
 		}
-		const isChinese = this.currentIME === this.settings.chineseIME;
-		this.statusBarItemEl.setText(isChinese ? '中' : 'EN');
+		this.statusBarItemEl.setText(label);
 	}
 
 	private async toggleIME() {
@@ -133,8 +166,14 @@ export default class SmartIMEPlugin extends Plugin {
 			new Notice('Please configure Chinese and English IME identifiers first');
 			return;
 		}
+		// Read the real state first: the user may have switched manually
+		await this.syncCurrentIME();
 		const target = this.currentIME === this.settings.chineseIME ? 'en' : 'zh';
-		await this.switchIME(target);
+		const ok = await this.switchIME(target);
+		if (!ok) {
+			new Notice('Smart IME: failed to switch IME');
+			return;
+		}
 		new Notice(target === 'zh' ? '切换到中文' : 'Switched to English');
 	}
 
@@ -150,136 +189,150 @@ export default class SmartIMEPlugin extends Plugin {
 		return false;
 	}
 
-	private async detectIMEConfig() {
-		try {
-			const vaultPath = (this.app.vault.adapter as any).basePath as string;
-			const isWin = process.platform === 'win32';
-			// Prefer user custom path if provided
-			if (this.settings.imSelectCustomPath && this.settings.imSelectCustomPath.trim().length > 0) {
-				const p = this.settings.imSelectCustomPath.trim();
-				try { await access(p); this.imSelectPath = p; return; } catch {}
-			}
-			if (isWin) {
-				const localWin = `${vaultPath}\\.obsidian\\plugins\\smart-ime\\im-select.exe`;
-				try { await access(localWin); this.imSelectPath = localWin; return; } catch {}
-				this.imSelectPath = 'im-select.exe';
-				return;
-			}
-			// macOS
-			if (process.platform === 'darwin') {
-				const candidates = [
-					'/opt/homebrew/bin/im-select',
-					'/usr/local/bin/im-select',
-					`${vaultPath}/.obsidian/plugins/smart-ime/im-select`,
-				];
-				for (const p of candidates) {
-					try { await access(p); this.imSelectPath = p; return; } catch {}
-				}
-				this.imSelectPath = 'im-select'; // fallback to PATH
-				return;
-			}
-			// Linux
-			if (process.platform === 'linux') {
-				const candidates = [
-					'/usr/local/bin/im-select',
-					'/usr/bin/im-select',
-					`${vaultPath}/.obsidian/plugins/smart-ime/im-select`,
-				];
-				for (const p of candidates) {
-					try { await access(p); this.imSelectPath = p; return; } catch {}
-				}
-				this.imSelectPath = 'im-select'; // fallback to PATH
-				return;
-			}
-		} catch (e) {
-			console.warn('IME config detect failed, using PATH fallback');
-			this.imSelectPath = process.platform === 'win32' ? 'im-select.exe' : 'im-select';
+	private getPluginDirPath(): string | null {
+		const adapter = this.app.vault.adapter;
+		if (!(adapter instanceof FileSystemAdapter) || !this.manifest.dir) return null;
+		// manifest.dir is vault-relative and follows the user's config folder name
+		return path.join(adapter.getBasePath(), this.manifest.dir);
+	}
+
+	async detectIMEConfig() {
+		this.imSelectFailureNotified = false;
+		const custom = this.settings.imSelectCustomPath.trim();
+		if (custom.length > 0) {
+			this.imSelectPath = custom;
+			return;
 		}
+		const exeName = process.platform === 'win32' ? 'im-select.exe' : 'im-select';
+		const candidates: string[] = [];
+		const pluginDir = this.getPluginDirPath();
+		if (pluginDir) candidates.push(path.join(pluginDir, exeName));
+		if (process.platform === 'darwin') {
+			candidates.push('/opt/homebrew/bin/im-select', '/usr/local/bin/im-select');
+		} else if (process.platform === 'linux') {
+			candidates.push('/usr/local/bin/im-select', '/usr/bin/im-select');
+		}
+		for (const p of candidates) {
+			try { await access(p); this.imSelectPath = p; return; } catch { /* try next */ }
+		}
+		this.imSelectPath = exeName; // fallback to PATH
 	}
 
 	private resolveImSelectExecutable(): string {
-		const custom = (this.settings.imSelectCustomPath || '').trim();
+		const custom = this.settings.imSelectCustomPath.trim();
 		if (custom.length > 0) return custom;
-		if (this.imSelectPath && this.imSelectPath.length > 0) return this.imSelectPath;
-		return process.platform === 'win32'
-			? `${(this.app.vault.adapter as any).basePath}\\.obsidian\\plugins\\smart-ime\\im-select.exe`
-			: 'im-select';
+		if (this.imSelectPath.length > 0) return this.imSelectPath;
+		return process.platform === 'win32' ? 'im-select.exe' : 'im-select';
 	}
 
-	private async obtainCurrentIME(): Promise<string | null> {
+	private async execImSelect(args: string[]): Promise<string> {
+		const { stdout } = await execFileAsync(this.resolveImSelectExecutable(), args, {
+			timeout: IM_SELECT_TIMEOUT_MS,
+			windowsHide: true,
+		});
+		return (stdout || '').trim();
+	}
+
+	// Like execImSelect, but tells the user once when im-select can't be run
+	private async runImSelect(args: string[]): Promise<string> {
 		try {
-			await this.detectIMEConfig();
-			const exe = this.resolveImSelectExecutable();
-			const { stdout } = await execFileAsync(exe, []);
-			const id = (stdout || '').trim();
-			return id || null;
+			return await this.execImSelect(args);
 		} catch (e) {
-			console.error('Failed to obtain current IME:', e);
+			const exe = this.resolveImSelectExecutable();
+			console.error(`Smart IME: im-select failed (${exe})`, e);
+			if (!this.imSelectFailureNotified) {
+				this.imSelectFailureNotified = true;
+				new Notice(`Smart IME: failed to run im-select (${exe}). Check "im-select path" in settings.`, 8000);
+			}
+			throw e;
+		}
+	}
+
+	private setCurrentIME(id: string) {
+		this.currentIME = id;
+		this.currentIMEAt = Date.now();
+		this.imeStateVersion++;
+		this.updateCursorStyle();
+		this.updateStatusBar();
+	}
+
+	// Read the actual system IME into the cache
+	private async syncCurrentIME(): Promise<string | null> {
+		const version = this.imeStateVersion;
+		let id: string;
+		try {
+			id = await this.runImSelect([]);
+		} catch {
 			return null;
 		}
+		// A switch that finished while we were reading is newer than this result
+		if (id && version === this.imeStateVersion) this.setCurrentIME(id);
+		return id || null;
 	}
 
 	async testIMSelect() {
 		await this.detectIMEConfig();
-		const exe = this.resolveImSelectExecutable();
-		let msg = `im-select: ${exe}`;
-		const current = await this.obtainCurrentIME();
-		if (current) {
+		let msg = `im-select: ${this.resolveImSelectExecutable()}`;
+		try {
+			const current = await this.execImSelect([]);
+			if (!current) throw new Error('empty output');
+			this.setCurrentIME(current);
 			msg += `\ncurrent IME: ${current}`;
 			try {
-				await execFileAsync(exe, [current]); // verify argument mode without changing IME
+				await this.execImSelect([current]); // verify argument mode without changing IME
 				msg += `\nargument mode: OK`;
 			} catch (e) {
 				msg += `\nargument mode: FAILED`;
 			}
-		} else {
-			msg += `\ncurrent IME: FAILED`;
+		} catch (e) {
+			msg += `\ncurrent IME: FAILED (${e instanceof Error ? e.message : String(e)})`;
 		}
-		new Notice(msg, 6000);
+		new Notice(msg, 8000);
+	}
+
+	// Paste, drop, undo/redo and similar bulk edits are not typing
+	private isTypingUpdate(update: ViewUpdate): boolean {
+		return !update.transactions.some(tr =>
+			tr.isUserEvent('input.paste') ||
+			tr.isUserEvent('input.drop') ||
+			tr.isUserEvent('move') ||
+			tr.isUserEvent('undo') ||
+			tr.isUserEvent('redo'));
 	}
 
 	private handleDocChange(update: ViewUpdate) {
 		const now = Date.now();
 
 		const view = update.view;
+		const state = update.state;
 
-		const pos = view.state.selection.main.head;
-		const line = view.state.doc.lineAt(pos);
+		const pos = state.selection.main.head;
+		const line = state.doc.lineAt(pos);
 		const textBefore = line.text.slice(0, pos - line.from);
 
 		// Skip if in code block
-		if (this.isInCodeBlock(view.state.doc as any, pos)) {
+		const context = this.getEditContext(state, pos);
+		if (context === 'code') {
 			return;
 		}
 
 		// Skip if this is a deletion (no text inserted)
-		let isInsertion = false;
+		let insertedText = '';
 		update.changes.iterChanges((fromA, toA, fromB, toB, inserted) => {
-			if (inserted && inserted.length > 0) {
-				isInsertion = true;
-			}
+			insertedText += inserted.toString();
 		});
-		if (!isInsertion) {
+		if (insertedText.length === 0) {
 			return;
 		}
 
 		// Newline to Chinese (smart, delayed)
 		if (this.settings.switchToChineseOnNewline) {
-			let insertedNewline = false;
-			let insertedText = '';
-			update.changes.iterChanges((fromA, toA, fromB, toB, inserted) => {
-				try {
-					const str = inserted && (inserted as any).toString ? (inserted as any).toString() : '';
-					if (str.includes('\n')) insertedNewline = true;
-					insertedText += str;
-				} catch {}
-			});
-			// Fallback: if doc changed and caret moved to next line start, treat as newline
+			let insertedNewline = insertedText.includes('\n');
+			// Fallback: if caret moved to next line, treat as newline
 			if (!insertedNewline) {
 				const prev = update.startState.selection.main.head;
-				const prevLineNo = (update.startState.doc as any).lineAt(prev).number;
-				const curLineNo = (view.state.doc as any).lineAt(pos).number;
-				if (curLineNo === prevLineNo + 1) {
+				const prevLineNo = update.startState.doc.lineAt(prev).number;
+				if (line.number === prevLineNo + 1) {
 					insertedNewline = true;
 				}
 			}
@@ -293,25 +346,25 @@ export default class SmartIMEPlugin extends Plugin {
 			}
 			if (insertedNewline) {
 				this.clearNewlineTimer();
-				this.newlineTimer = setTimeout(() => {
-					this.switchIME('zh');
-					this.clearNewlineTimer();
+				this.newlineTimer = window.setTimeout(() => {
+					this.newlineTimer = null;
+					void this.switchIME('zh');
 				}, this.settings.newlineSwitchDelayMs);
 			}
 		}
 
 		// Check if in math context
 		const prevPos = update.startState.selection.main.head;
-		const prevInMath = this.isInMathContextDoc(update.startState.doc as any, prevPos);
-		const inMath = this.isInMathContextDoc(view.state.doc as any, pos);
+		const prevInMath = this.getEditContext(update.startState, prevPos) === 'math';
+		const inMath = context === 'math';
 		// Leaving math context → switch to Chinese
 		if (this.settings.switchToChineseOnLeaveMath && prevInMath && !inMath) {
-			this.switchIME('zh');
+			void this.switchIME('zh');
 			this.clearNewlineTimer();
 			return;
 		}
 		if (inMath && this.settings.switchToEnglishInMath) {
-			this.switchIME('en');
+			void this.switchIME('en');
 			this.clearNewlineTimer();
 			return;
 		}
@@ -340,7 +393,7 @@ export default class SmartIMEPlugin extends Plugin {
 				if (from >= 0) {
 					view.dispatch({ changes: { from, to, insert: '' } });
 				}
-				this.switchIME('zh');
+				void this.switchIME('zh');
 				return;
 			}
 		}
@@ -349,7 +402,7 @@ export default class SmartIMEPlugin extends Plugin {
 		if (lastChar === ' ' && this.settings.spaceToEnglish) {
 			const charBeforeSpace = textBefore.slice(-2, -1);
 			if (this.isChinese(charBeforeSpace)) {
-				this.switchIME('en');
+				void this.switchIME('en');
 				return;
 			}
 		}
@@ -358,93 +411,97 @@ export default class SmartIMEPlugin extends Plugin {
 		if (this.settings.switchByPreviousChar && this.isChinese(lastChar)) {
 			if (now - this.lastCheckTime >= this.settings.switchInterval) {
 				this.lastCheckTime = now;
-				this.switchIME('zh');
+				void this.switchIME('zh');
 			}
 		}
 	}
 
 	private handleSelectionUpdate(update: ViewUpdate) {
-		const pos = update.view.state.selection.main.head;
+		const pos = update.state.selection.main.head;
+		const context = this.getEditContext(update.state, pos);
+		if (context === 'code') return;
 		const prevPos = update.startState.selection.main.head;
-		const prevInMath = this.isInMathContextDoc(update.startState.doc as any, prevPos);
-		const inMath = this.isInMathContextDoc(update.view.state.doc as any, pos);
+		const prevInMath = this.getEditContext(update.startState, prevPos) === 'math';
+		const inMath = context === 'math';
 		// Leaving math → Chinese
 		if (this.settings.switchToChineseOnLeaveMath && prevInMath && !inMath) {
-			this.switchIME('zh');
+			void this.switchIME('zh');
 			this.clearNewlineTimer();
 			return;
 		}
 		// Entering math → English
 		if (inMath && this.settings.switchToEnglishInMath) {
-			this.switchIME('en');
+			void this.switchIME('en');
 			this.clearNewlineTimer();
 			return;
 		}
 	}
 
-	private isInMathContextDoc(doc: any, pos: number): boolean {
-		const line = doc.lineAt(pos);
-		const textBefore = line.text.slice(0, pos - line.from);
-		// Remove escaped \$ before counting
-		const textWithoutEscaped = textBefore.replace(/\\\$/g, '');
-		// Inline math $...$
-		const dollarCount = (textWithoutEscaped.match(/\$/g) || []).length;
-		if (dollarCount % 2 === 1) return true;
-		// Display math $$...$$ spanning multiple lines: find nearest $$ above and below
-		const curLine = line.number;
-		let start = -1;
-		// Search from previous line to avoid matching current line's $$
-		for (let i = curLine - 1; i >= Math.max(1, curLine - 400); i--) {
-			const t = doc.line(i).text.trim();
-			if (t === '$$') { start = i; break; }
-		}
-		if (start !== -1) {
-			let end = -1;
-			const total = (doc as any).lines || (doc as any).lineCount || 1000000;
-			// Search from next line
-			for (let i = curLine + 1; i <= Math.min(total, start + 400); i++) {
-				const t = doc.line(i).text.trim();
-				if (t === '$$') { end = i; break; }
-			}
-			if (end !== -1) return true;
-		}
-		// Fallback: $$ before cursor on current line (rare)
-		const doubleDollarCount = (textBefore.match(/\$\$/g) || []).length;
-		if (doubleDollarCount % 2 === 1) return true;
-		return false;
-	}
+	// Classify the cursor position with Obsidian's markdown syntax tree, which pairs
+	// $$ and ``` delimiters exactly like the renderer does. Current-line heuristics
+	// additionally catch $ and ` that have been typed but not closed yet.
+	private getEditContext(state: EditorState, pos: number): EditContext {
+		const tree = ensureSyntaxTree(state, pos, 20) ?? syntaxTree(state);
+		const doc = state.doc;
+		// Obsidian's tree is flat: styled tokens are children of the top node, while
+		// plain text and line breaks resolve to the top node itself (no parent)
+		const tokenBefore = (p: number): string => {
+			if (p < 0 || p > doc.length) return '';
+			const node = tree.resolveInner(p, -1);
+			return node.parent ? node.name : '';
+		};
+		const tokenAfter = (p: number): string => {
+			if (p < 0 || p > doc.length) return '';
+			const node = tree.resolveInner(p, 1);
+			return node.parent ? node.name : '';
+		};
 
-	private isInCodeBlock(doc: any, pos: number): boolean {
 		const line = doc.lineAt(pos);
 		const textBefore = line.text.slice(0, pos - line.from);
-		// Inline code `...`
+		const before = tokenBefore(pos);
+		const after = tokenAfter(pos);
+		const isEmptyLine = line.length === 0;
+		// Neighbouring tokens for an empty line: end of previous line, start of next line
+		const prevLineEnd = isEmptyLine ? tokenBefore(line.from - 1) : '';
+		const nextLineStart = isEmptyLine ? tokenAfter(line.to + 1) : '';
+
+		// Code: fenced blocks and inline code
+		const isCodeblock = (name: string) => name.includes('codeblock');
+		const isInlineCode = (name: string) => name.includes('inline-code');
+		if (before) {
+			if (isCodeblock(before) || isInlineCode(before)) return 'code';
+		} else if (pos === line.from && after) {
+			// Start of a non-empty line: inside a block unless this is its opening fence
+			if (isCodeblock(after) && !after.includes('codeblock-begin')) return 'code';
+		} else if (isEmptyLine) {
+			if (isCodeblock(prevLineEnd) && !prevLineEnd.includes('codeblock-end') &&
+				isCodeblock(nextLineStart) && !nextLineStart.includes('codeblock-begin')) return 'code';
+		}
+		// Unclosed inline code on the current line
 		const backtickCount = (textBefore.match(/`/g) || []).length;
-		// Exclude triple backticks from count
 		const tripleBackticks = (textBefore.match(/```/g) || []).length;
-		const singleBackticks = backtickCount - tripleBackticks * 3;
-		if (singleBackticks % 2 === 1) return true;
-		// Fenced code block ```...```
-		const curLine = line.number;
-		let start = -1;
-		for (let i = curLine - 1; i >= Math.max(1, curLine - 400); i--) {
-			const t = doc.line(i).text.trim();
-			if (t.startsWith('```')) { start = i; break; }
+		if ((backtickCount - tripleBackticks * 3) % 2 === 1) return 'code';
+
+		// Math: $...$ and $$...$$
+		if (before) {
+			if (before.includes('math-end')) return 'text';
+			if (before.includes('math')) return 'math';
+		} else if (after) {
+			if (!after.includes('math-begin') && after.includes('math')) return 'math';
+		} else if (isEmptyLine) {
+			if (prevLineEnd.includes('math') && !prevLineEnd.includes('math-end') &&
+				nextLineStart.includes('math')) return 'math';
 		}
-		if (start !== -1) {
-			let end = -1;
-			const total = (doc as any).lines || (doc as any).lineCount || 1000000;
-			for (let i = curLine + 1; i <= Math.min(total, start + 400); i++) {
-				const t = doc.line(i).text.trim();
-				if (t === '```') { end = i; break; }
-			}
-			if (end !== -1) return true;
-		}
-		return false;
+		// Unclosed inline math on the current line (escaped \$ ignored)
+		const dollarCount = (textBefore.replace(/\\\$/g, '').match(/\$/g) || []).length;
+		if (dollarCount % 2 === 1) return 'math';
+
+		return 'text';
 	}
 
 	private clearNewlineTimer() {
 		if (this.newlineTimer) {
-			clearTimeout(this.newlineTimer);
+			window.clearTimeout(this.newlineTimer);
 			this.newlineTimer = null;
 		}
 	}
@@ -473,32 +530,45 @@ export default class SmartIMEPlugin extends Plugin {
 		return false;
 	}
 
-	private async switchIME(target: 'zh' | 'en') {
-		const targetIME = target === 'zh' ? this.settings.chineseIME : this.settings.englishIME;
-		if (!targetIME || this.currentIME === targetIME) return;
-
-		// Prevent concurrent IME switches
-		if (this.isSwitchingIME) return;
-		this.isSwitchingIME = true;
-
-		try {
-			const custom = (this.settings.imSelectCustomPath || '').trim();
-			const exe = custom.length > 0
-				? custom
-				: (this.imSelectPath && this.imSelectPath.length > 0
-				? this.imSelectPath
-				: (process.platform === 'win32'
-					? `${(this.app.vault.adapter as any).basePath}\\.obsidian\\plugins\\smart-ime\\im-select.exe`
-					: 'im-select'));
-			await execFileAsync(exe, [targetIME]);
-			this.currentIME = targetIME;
-			this.updateCursorStyle();
-			this.updateStatusBar();
-		} catch (e) {
-			console.error('Failed to switch IME:', e);
-		} finally {
-			this.isSwitchingIME = false;
+	// Requests are coalesced instead of dropped: while a switch is running, the
+	// latest requested target is remembered and applied right after it.
+	private switchIME(target: IMETarget): Promise<boolean> {
+		this.pendingTarget = target;
+		if (!this.switchLoop) {
+			this.switchLoop = this.drainSwitchQueue();
 		}
+		return this.switchLoop;
+	}
+
+	private async drainSwitchQueue(): Promise<boolean> {
+		let ok = false;
+		try {
+			while (this.pendingTarget) {
+				const target = this.pendingTarget;
+				this.pendingTarget = null;
+				ok = await this.applyIME(target);
+			}
+		} finally {
+			this.switchLoop = null;
+		}
+		return ok;
+	}
+
+	private async applyIME(target: IMETarget): Promise<boolean> {
+		const targetIME = target === 'zh' ? this.settings.chineseIME : this.settings.englishIME;
+		if (!targetIME) return false;
+		if (this.currentIME === targetIME) {
+			if (Date.now() - this.currentIMEAt < IME_CACHE_TTL_MS) return true;
+			// Cached state is old; confirm before skipping
+			if (await this.syncCurrentIME() === targetIME) return true;
+		}
+		try {
+			await this.runImSelect([targetIME]);
+		} catch {
+			return false;
+		}
+		this.setCurrentIME(targetIME);
+		return true;
 	}
 
 	async loadSettings() {
@@ -528,8 +598,10 @@ class SmartIMESettingTab extends PluginSettingTab {
 			.addText(text => text
 				.setValue(this.plugin.settings.chineseIME)
 				.onChange(async (value) => {
-					this.plugin.settings.chineseIME = value;
+					this.plugin.settings.chineseIME = value.trim();
 					await this.plugin.saveSettings();
+					this.plugin.updateStatusBar();
+					this.plugin.updateCursorStyle();
 				}));
 
 		new Setting(containerEl)
@@ -538,8 +610,10 @@ class SmartIMESettingTab extends PluginSettingTab {
 			.addText(text => text
 				.setValue(this.plugin.settings.englishIME)
 				.onChange(async (value) => {
-					this.plugin.settings.englishIME = value;
+					this.plugin.settings.englishIME = value.trim();
 					await this.plugin.saveSettings();
+					this.plugin.updateStatusBar();
+					this.plugin.updateCursorStyle();
 				}));
 
 		new Setting(containerEl)
@@ -552,14 +626,14 @@ class SmartIMESettingTab extends PluginSettingTab {
 					this.plugin.settings.imSelectCustomPath = value;
 					await this.plugin.saveSettings();
 					// re-detect to apply immediately
-					try { await (this.plugin as any).detectIMEConfig?.(); } catch {}
+					await this.plugin.detectIMEConfig();
 				}));
 
 		new Setting(containerEl)
 			.setName('Test im-select')
 			.setDesc('Run im-select to detect current IME and validate argument mode')
 			.addButton(btn => btn
-				.setButtonText('Run Test')
+				.setButtonText('Run test')
 				.onClick(async () => {
 					await this.plugin.testIMSelect();
 				}));
@@ -680,7 +754,9 @@ class SmartIMESettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('Chinese cursor color')
+			.setDesc('Hex, rgb() or a color name. Leave empty to use the theme color.')
 			.addText(text => text
+				.setPlaceholder('Theme default')
 				.setValue(this.plugin.settings.chineseCursorColor)
 				.onChange(async (value) => {
 					this.plugin.settings.chineseCursorColor = value;
@@ -690,7 +766,9 @@ class SmartIMESettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('English cursor color')
+			.setDesc('Hex, rgb() or a color name. Leave empty to use the theme color.')
 			.addText(text => text
+				.setPlaceholder('Theme default')
 				.setValue(this.plugin.settings.englishCursorColor)
 				.onChange(async (value) => {
 					this.plugin.settings.englishCursorColor = value;

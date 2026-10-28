@@ -1,10 +1,10 @@
 {
-	"id": "smart-ime-obsidian",
+	"id": "smart-ime",
 	"name": "Smart IME",
 	"version": "1.0.0",
-	"minAppVersion": "0.15.0",
-	"description": "Automatically switch between Chinese and English IME based on context",
-	"author": "Your Name",
-	"authorUrl": "",
-    "isDesktopOnly": true
+	"minAppVersion": "1.0.0",
+	"description": "Automatically switch between Chinese and English input methods while typing, with math and code awareness. Requires the im-select tool.",
+	"author": "nwh-phy",
+	"authorUrl": "https://github.com/nwh-phy",
+	"isDesktopOnly": true
 }
